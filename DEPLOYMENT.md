@@ -163,7 +163,8 @@ docker compose ps
 ```
 
 - `control` 提供报告页的启动/停止 API；它使用 `/state/config.json`、私有 Compose secret 中的凭据、`/state/data` 和 `/state/reports`。
-- `report` 默认只绑定 `127.0.0.1:8097`，访问 `/` 或 `/report.html` 查看报告，`/healthz` 做健康检查。
+- `report` 默认只绑定 `127.0.0.1:8097`，访问 `/` 或 `/report.html` 查看报告；容器健康检查直接读取 `/report.html`，报告缺失或因目录权限不可读时不会误报健康。
+- `report`、`worker` 和 `toolbox` 使用同一组 `DIAGNOSTIC_UID`/`DIAGNOSTIC_GID`。保持状态目录为 `0700` 时，该 UID/GID 必须与目录属主一致。
 - `worker` 保留为命令行兼容入口，使用 `docker compose --profile worker up -d` 可绕过网页控制直接等待下一个整点。
 - 管理操作通过 tools profile 执行，例如：
 
