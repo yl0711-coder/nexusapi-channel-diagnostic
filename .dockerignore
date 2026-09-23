@@ -5,3 +5,4 @@
 !manage.py
 !control_server.py
 !requirements.txt
+!config.example.json
