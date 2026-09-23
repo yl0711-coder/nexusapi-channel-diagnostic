@@ -31,7 +31,7 @@ services:
       - "127.0.0.1:${REPORT_PORT:-8097}:8080"
     volumes:
       - ./nginx.quickstart.conf:/etc/nginx/nginx.conf:ro
-      - quickstart-state:/srv/reports:ro
+      - quickstart-state:/srv:ro
     read_only: true
     tmpfs: [/tmp]
     cap_drop: [ALL]
