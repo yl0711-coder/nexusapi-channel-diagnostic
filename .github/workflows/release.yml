@@ -99,11 +99,13 @@ jobs:
         run: |
           set -Eeuo pipefail
           mkdir -p "$RUNNER_TEMP/runtime-tests"
-          docker run --rm --network none --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
-            --user "$(id -u):$(id -g)" \
-            --volume "$PWD:/source:ro" --volume "$RUNNER_TEMP/runtime-tests:/checks" \
-            --env DIAGNOSTIC_TEST_ROOT=/checks --workdir /source \
-            hourly-channel-diagnostic:ci -m unittest discover -s tests -p 'test_*.py' -v
+          for suite in test_domain.py test_http.py test_catalog.py; do
+            docker run --rm --network none --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
+              --user "$(id -u):$(id -g)" \
+              --volume "$PWD:/source:ro" --volume "$RUNNER_TEMP/runtime-tests:/checks" \
+              --env DIAGNOSTIC_TEST_ROOT=/checks --workdir /source \
+              hourly-channel-diagnostic:ci -m unittest discover -s tests -p "$suite" -v
+          done
           docker run --rm --network none hourly-channel-diagnostic:ci -c \
             'import ssl; from zoneinfo import ZoneInfo; assert ssl.create_default_context().cert_store_stats()["x509_ca"] > 0; assert str(ZoneInfo("Asia/Shanghai")) == "Asia/Shanghai"'
 
