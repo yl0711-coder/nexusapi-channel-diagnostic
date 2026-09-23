@@ -55,6 +55,14 @@ JUICE_PROMPTS = (
 )
 
 
+class TerminationRequested(BaseException):
+    """Container shutdown interrupts a round without treating it as a request error."""
+
+
+def on_termination(_signum: int, _frame: Any) -> None:
+    raise TerminationRequested
+
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -396,7 +404,7 @@ def connect(db_path: Path) -> sqlite3.Connection:
     CREATE TABLE IF NOT EXISTS runs (
       id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT,
       hour_key TEXT NOT NULL, mock INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL,
-      channels INTEGER NOT NULL DEFAULT 0, error TEXT
+      channels INTEGER NOT NULL DEFAULT 0, error TEXT, planned_requests INTEGER
     );
     CREATE TABLE IF NOT EXISTS observations (
       id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES runs(id),
@@ -408,6 +416,9 @@ def connect(db_path: Path) -> sqlite3.Connection:
     );
     CREATE INDEX IF NOT EXISTS idx_obs_hour ON observations(hour_key, channel);
     """)
+    run_columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+    if "planned_requests" not in run_columns:
+        conn.execute("ALTER TABLE runs ADD COLUMN planned_requests INTEGER")
     columns = {row[1] for row in conn.execute("PRAGMA table_info(observations)")}
     for name, declaration in (("echoed_effort", "TEXT"),
                               ("reasoning_tokens_present", "INTEGER"),
@@ -479,6 +490,22 @@ def run_once(config: dict[str, Any], db_path: Path, mock: bool = False,
         return execute_run(config, db_path, mock, credentials or {})
 
 
+def recover_orphaned_runs(db_path: Path) -> int:
+    """Close abandoned rows only when no diagnostic owns the run lock."""
+    if not db_path.exists():
+        return 0
+    with run_lock(db_path):
+        conn = connect(db_path)
+        try:
+            result = conn.execute(
+                "UPDATE runs SET status='interrupted', error='abrupt_exit', finished_at=? WHERE status='running'",
+                (now_utc().isoformat(),))
+            conn.commit()
+            return result.rowcount
+        finally:
+            conn.close()
+
+
 def execute_run(config: dict[str, Any], db_path: Path, mock: bool, credentials: dict[str, Any]) -> int:
     channels = [item for item in config.get("channels", []) if item.get("enabled", True)]
     if not channels:
@@ -492,11 +519,13 @@ def execute_run(config: dict[str, Any], db_path: Path, mock: bool, credentials: 
     if conn.execute("SELECT 1 FROM runs WHERE mock != ? LIMIT 1", (int(mock),)).fetchone():
         conn.close()
         raise RuntimeError("Mock 与真实运行必须使用不同的数据目录")
-    conn.execute("UPDATE runs SET status='interrupted', error='process_interrupted' WHERE status='running'")
+    conn.execute("UPDATE runs SET status='interrupted', error='abrupt_exit', finished_at=? WHERE status='running'",
+                 (now_utc().isoformat(),))
     started = now_utc()
     timezone_name = str(config["timezone"])
-    cur = conn.execute("INSERT INTO runs (started_at, hour_key, mock, status, channels) VALUES (?,?,?,?,?)",
-                       (started.isoformat(), hour_key(started, timezone_name), int(mock), "running", len(channels)))
+    planned = len(channels) * len(config["test_models"]) * (int(config["rounds"]) * 6 + int(config["juice_runs"]) * 5)
+    cur = conn.execute("INSERT INTO runs (started_at, hour_key, mock, status, channels, planned_requests) VALUES (?,?,?,?,?,?)",
+                       (started.isoformat(), hour_key(started, timezone_name), int(mock), "running", len(channels), planned))
     run_id = cur.lastrowid
     conn.commit()
     try:
@@ -540,9 +569,11 @@ def execute_run(config: dict[str, Any], db_path: Path, mock: bool, credentials: 
         conn.execute("UPDATE runs SET finished_at=?, status='completed' WHERE id=?", (now_utc().isoformat(), run_id))
         conn.commit()
     except BaseException as exc:
-        status = "interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed"
+        status = "interrupted" if isinstance(exc, (KeyboardInterrupt, TerminationRequested)) else "failed"
+        reason = ("operator_stop" if isinstance(exc, KeyboardInterrupt) else
+                  "system_shutdown" if isinstance(exc, TerminationRequested) else type(exc).__name__)
         conn.execute("UPDATE runs SET finished_at=?, status=?, error=? WHERE id=?",
-                     (now_utc().isoformat(), status, type(exc).__name__, run_id))
+                     (now_utc().isoformat(), status, reason, run_id))
         conn.commit()
         raise
     finally:
@@ -555,10 +586,11 @@ def execute_run(config: dict[str, Any], db_path: Path, mock: bool, credentials: 
     return int(run_id)
 
 
-def aggregate(db_path: Path, detailed: bool = False) -> list[dict[str, Any]]:
+def aggregate(db_path: Path, detailed: bool = False, completed_only: bool = False) -> list[dict[str, Any]]:
     conn = connect(db_path)
+    where = "WHERE r.status='completed' " if completed_only else ""
     rows = conn.execute("SELECT o.*, r.mock FROM observations o JOIN runs r ON r.id=o.run_id "
-                        "ORDER BY o.timestamp, o.id").fetchall()
+                        + where + "ORDER BY o.timestamp, o.id").fetchall()
     conn.close()
     groups = defaultdict(list)
     for row in rows:
@@ -699,6 +731,19 @@ def report_table(headers: list[str], rows: list[list[str]], table_id: str) -> st
     return f"<div class='scroll'><table id='{table_id}'><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
 
 
+def run_status_label(status: str, reason: str | None) -> str:
+    if status == "completed":
+        return "已执行完毕"
+    if status == "running":
+        return "执行中"
+    if status == "failed":
+        return "执行失败"
+    if status == "interrupted":
+        return {"operator_stop": "管理员中断", "system_shutdown": "系统中断",
+                "abrupt_exit": "异常中断"}.get(reason, "已中断（旧记录或原因未明）")
+    return "未知状态"
+
+
 def control_panel() -> str:
     """报告页的控制面板；写操作必须经过控制服务令牌。"""
     return """<style>#control-panel input{max-width:320px;padding:7px;border:1px solid #cbd5e1;border-radius:6px}#control-panel button{margin:4px;padding:7px 12px;border:1px solid #94a3b8;border-radius:6px;background:#f8fafc;cursor:pointer}#control-panel button:disabled{cursor:not-allowed;opacity:.5}@media(max-width:600px){#control-panel input{width:100%;box-sizing:border-box}#control-panel button{margin-left:0}}</style>
@@ -710,6 +755,7 @@ def control_panel() -> str:
 <button type='button' id='control-run-once'>立即执行一轮</button>
 <button type='button' id='control-stop'>停止检测</button>
 <button type='button' id='control-refresh'>刷新状态</button></p>
+<p>立即执行一轮与定时检测不会并发；若正在等待整点，请先停止定时检测，再执行单轮。</p>
 <p id='control-message' role='status'>报告页只读加载中；控制服务连接后可执行操作。</p></section>
 <script>(function(){
   const token = document.getElementById('control-token');
@@ -723,7 +769,8 @@ def control_panel() -> str:
   const runOnce = document.getElementById('control-run-once');
   const stop = document.getElementById('control-stop');
   const refreshButton = document.getElementById('control-refresh');
-  const labels = {running:'运行中', stopped:'未启动', failed:'上次启动失败'};
+  const labels = {waiting:'等待整点', checking:'检测中', starting:'启动中',
+                  stopped:'已停止', failed:'运行异常'};
   function setMessage(text, error){ message.textContent = text; message.style.color = error ? '#b91c1c' : '#475569'; }
   async function request(path, method){
     const headers = {};
@@ -735,11 +782,19 @@ def control_panel() -> str:
     return body;
   }
   function render(data){
-    state.textContent = labels[data.state] || data.state || '未知';
+    state.textContent = labels[data.phase] || data.phase || '未知';
     enabled.textContent = String(data.enabled_channels == null ? '—' : data.enabled_channels);
     total.textContent = String(data.total_channels == null ? '—' : data.total_channels);
     const run = data.last_run;
-    lastRun.textContent = run ? (run.status + ' / ' + (run.started_at || '')) : '暂无运行记录';
+    const progress = run ? `${run.executed_requests}/${run.planned_requests == null ? '计划数未记录' : run.planned_requests}` : '';
+    lastRun.textContent = run ? `${run.label} · ${progress} 项 · 成功 ${run.succeeded_requests} 项 / ${run.started_at || ''}` : '暂无运行记录';
+    if (data.state === 'failed') {
+      const reason = data.last_stop_reason;
+      if (reason === 'control_token_missing') setMessage('控制令牌未配置，定时检测未恢复；请检查控制容器配置。', true);
+      else if (reason === 'resume_failed') setMessage('容器重启后未能恢复定时检测；请检查配置、凭据和 worker.log。', true);
+      else if (reason === 'recovery_failed') setMessage('中断记录修复失败；请检查数据库、运行锁和报告目录。', true);
+      else setMessage(`检测进程异常退出；退出码 ${data.last_exit_code ?? '未知'}，请检查本机 worker.log。`, true);
+    }
     start.disabled = data.state === 'running';
     enableStart.disabled = data.state === 'running';
     runOnce.disabled = data.state === 'running';
@@ -751,6 +806,7 @@ def control_panel() -> str:
   }
   async function runAction(action, success, reload){
     start.disabled = true; enableStart.disabled = true; runOnce.disabled = true; stop.disabled = true;
+    if (action === '/api/stop') { state.textContent = '正在停止'; setMessage('正在保存本轮结果并停止检测…', false); }
     try { render(await request(action, 'POST')); setMessage(success, false); if (reload !== false) setTimeout(function(){ location.reload(); }, 500); return true; }
     catch (error) { setMessage(error.message, true); await refresh(); return false; }
   }
@@ -777,10 +833,15 @@ def build_report(db_path: Path, output: Path, timezone_name: str,
                  test_models: list[str] | None = None) -> None:
     if output.suffix.lower() not in (".html", ".htm") or output.resolve() == db_path.resolve():
         raise ValueError("报告必须使用独立的 HTML 文件路径")
-    data = aggregate(db_path)
-    details = aggregate(db_path, detailed=True)
+    # Incomplete rounds remain in run history, but must not masquerade as a healthy hourly sample.
+    data = aggregate(db_path, completed_only=True)
+    details = aggregate(db_path, detailed=True, completed_only=True)
     conn = connect(db_path)
-    runs = conn.execute("SELECT id,started_at,finished_at,mock,status FROM runs ORDER BY id DESC").fetchall()
+    runs = conn.execute("""SELECT r.id,r.started_at,r.finished_at,r.mock,r.status,r.error,r.planned_requests,
+                          COUNT(o.id) AS executed_requests,
+                          SUM(CASE WHEN o.ok=1 THEN 1 ELSE 0 END) AS succeeded_requests
+                          FROM runs r LEFT JOIN observations o ON o.run_id=r.id
+                          GROUP BY r.id ORDER BY r.id DESC""").fetchall()
     conn.close()
     parts = ["<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>",
              "<title>小时渠道诊断</title><style>body{font:14px/1.6 system-ui;margin:0;background:#f1f5f9;color:#1e293b}main{max-width:1400px;margin:auto;padding:24px}section{margin:20px 0;padding:20px;background:white;border:1px solid #e2e8f0;border-radius:10px}h1,h2,h3{line-height:1.35}.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%}th,td{border-bottom:1px solid #e2e8f0;padding:8px;text-align:left;white-space:nowrap}th{background:#f8fafc}svg{display:block;width:100%;max-width:900px;background:#f8fafc}svg text{font:12px system-ui}.legend{display:flex;gap:8px 20px;flex-wrap:wrap;overflow-wrap:anywhere}p{color:#475569}.heatmap td{min-width:24px;text-align:center}details{margin:16px 0}summary{cursor:pointer;font-weight:600}@media(max-width:600px){main{padding:12px}section{padding:12px}h1{font-size:24px}}</style></head><body><main>",
@@ -788,7 +849,8 @@ def build_report(db_path: Path, output: Path, timezone_name: str,
              "<p>本次检测模型：" + html.escape("、".join(test_models or DEFAULT_TEST_MODELS)) + "。所有启用渠道只使用这些模型。</p>",
              "<p>倍率为你配置的渠道计费倍率，不是推理档位，也不是本程序计算的实际账单。历史指标使用请求当时保存的渠道、倍率与模型。</p>",
              "<p>成功率 = 有效响应 / 全部请求；正确率 = 答对 / 有效答题样本；回显匹配率仅统计 Responses 返回档位的样本，Chat 为不适用。Juice 验证率 = 期望值精确匹配 / 全部请求（包括失败和无法解析），每档达到 60% 标为 verified。该结果仅说明模型自报值与原脚本预设值一致。</p>",
-             "<p>Tokens 仅累计 usage.total_tokens；覆盖数不足时为部分小计，缺失显示 —，真实零显示 0。推理 Tokens 区分缺字段、空值和数值 0。旧版记录缺少可靠元数据，不参与总 Tokens 和回显匹配统计。运行 completed 表示矩阵执行完毕，不代表渠道全部通过。</p>"]
+             "<p>Tokens 仅累计 usage.total_tokens；覆盖数不足时为部分小计，缺失显示 —，真实零显示 0。推理 Tokens 区分缺字段、空值和数值 0。旧版记录缺少可靠元数据，不参与总 Tokens 和回显匹配统计。运行 completed 表示矩阵执行完毕，不代表渠道全部通过。</p>",
+             "<p>下方小时指标只使用已完整执行的轮次；中断或失败轮次及已完成样本保留在数据库与运行记录中，不冒充完整小时结果。请求失败仍计入完整轮次的成功率。</p>"]
     parts.append(control_panel())
     if channels is not None:
         catalog = [[display(c.get("id")), display(c.get("provider", c["name"])), display(c["name"]),
@@ -797,9 +859,19 @@ def build_report(db_path: Path, output: Path, timezone_name: str,
                     "已启用" if c.get("enabled", True) else "未启用"]
                    for c in channels]
         parts.append("<section><h2>渠道清单</h2>" + report_table(["渠道 ID", "服务商", "渠道", "倍率", "源文档模型", "实际检测模型", "配置状态"], catalog, "channels") + "</section>")
+    run_rows = []
+    for r in runs:
+        executed = int(r["executed_requests"] or 0)
+        succeeded = int(r["succeeded_requests"] or 0)
+        planned = r["planned_requests"]
+        progress = f"{executed}/{planned}" if planned is not None else f"{executed}/计划数未记录"
+        run_rows.append([display(r["id"]), "Mock" if r["mock"] else "真实",
+                         display(r["started_at"]), display(r["finished_at"]),
+                         html.escape(run_status_label(r["status"], r["error"])),
+                         display(progress), display(succeeded), display(executed - succeeded)])
     parts.append("<section><h2>运行记录</h2>" + report_table(
-        ["运行", "模式", "开始 UTC", "结束 UTC", "执行状态"],
-        [[display(r[k]) for k in ("id",)] + ["Mock" if r["mock"] else "真实"] + [display(r[k]) for k in ("started_at", "finished_at", "status")] for r in runs], "runs") + "</section>")
+        ["运行", "模式", "开始 UTC", "结束 UTC", "执行状态", "已执行/计划", "成功", "失败"],
+        run_rows, "runs") + "</section>")
     parts.append("<section><h2>小时概览</h2>" + svg_heatmap(data, timezone_name))
     overview = []
     for r in reversed(data):
@@ -910,6 +982,21 @@ def inspect_config(config: dict[str, Any]) -> None:
     }, ensure_ascii=False, indent=2))
 
 
+def run_and_report(config: dict[str, Any], db_path: Path, report_path: Path,
+                   mock: bool, credentials: dict[str, Any]) -> None:
+    try:
+        run_once(config, db_path, mock, credentials)
+    finally:
+        run_failed = sys.exc_info()[0] is not None
+        try:
+            build_report(db_path, report_path, str(config["timezone"]),
+                         config["channels"], config["test_models"])
+        except Exception as exc:
+            if not run_failed:
+                raise
+            print(f"报告刷新失败类别：{type(exc).__name__}", file=sys.stderr, flush=True)
+
+
 def command_main() -> int:
     parser = argparse.ArgumentParser(description="每小时渠道稳定性诊断（独立版）")
     parser.add_argument("command", choices=("inspect", "run-once", "daemon", "report"))
@@ -938,8 +1025,7 @@ def command_main() -> int:
         if not args.mock and not args.confirm_live:
             raise SystemExit("真实渠道运行需要显式添加 --confirm-live；本地验收请添加 --mock")
         credentials = {} if args.mock else load_credentials(args.credentials)
-        run_once(config, db_path, args.mock, credentials)
-        build_report(db_path, report_path, str(config["timezone"]), config["channels"], config["test_models"])
+        run_and_report(config, db_path, report_path, args.mock, credentials)
         print(f"报告：{report_path}")
         return 0
     if not args.mock and not args.confirm_live:
@@ -950,21 +1036,26 @@ def command_main() -> int:
         while True:
             time.sleep(next_hour_sleep(str(config["timezone"])))
             try:
-                run_once(config, db_path, args.mock, credentials)
-                build_report(db_path, report_path, str(config["timezone"]), config["channels"], config["test_models"])
+                run_and_report(config, db_path, report_path, args.mock, credentials)
             except Exception as exc:
                 print(f"本轮失败类别：{type(exc).__name__}", file=sys.stderr, flush=True)
 
 
 def main() -> int:
+    previous_term = signal.signal(signal.SIGTERM, on_termination)
     try:
         return command_main()
     except KeyboardInterrupt:
         print("诊断已停止；已完成的样本已保存。", file=sys.stderr)
         return 130
+    except TerminationRequested:
+        print("诊断因系统停止；已完成的样本已保存。", file=sys.stderr)
+        return 143
     except (ValueError, TypeError, RuntimeError, OSError, sqlite3.Error) as exc:
         print(f"执行失败类别：{type(exc).__name__}；请检查配置、密钥环境变量与数据目录。", file=sys.stderr)
         return 1
+    finally:
+        signal.signal(signal.SIGTERM, previous_term)
 
 
 if __name__ == "__main__":

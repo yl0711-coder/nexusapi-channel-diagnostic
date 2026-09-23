@@ -18,7 +18,7 @@
 | --- | --- | --- |
 | 直接运行 Python | macOS 或 Linux；Python 3.10+；标准库；系统时区数据 | 不需要 `pip install`。源码使用文件锁，Windows 不在支持范围内。 |
 | Docker Compose | Docker Engine 和 Compose v2；可构建本地镜像并拉取固定摘要的基础镜像 | 主机不需要安装 Python；容器仍需要访问渠道的 HTTPS 地址。 |
-| 离线验收 | Python 3.10+、Node.js、Playwright、Edge | 只用于 `scripts/test_all.py` 的 browser 组，不是线上运行依赖。 |
+| 离线验收 | Python 3.10+、Node.js、Playwright、Chromium | 只用于 `scripts/test_all.py` 的 browser 组，不是线上运行依赖。 |
 
 部署主机还必须满足：
 
@@ -26,7 +26,7 @@
 - 状态目录位于源码目录外，`config.json`、`credentials.json` 可读，`data/` 和 `reports/` 可写。
 - `credentials.json` 权限为 `0600` 或 `0400`；Docker Compose 下，运行用户的 UID/GID 要能读 secret 并写入数据和报告目录。
 - 默认报告服务只监听 `127.0.0.1:8097`；需要外部访问时由部署方另行配置反向代理和访问控制。
-- Docker 的报告控制区需要设置 `DIAGNOSTIC_CONTROL_TOKEN`。报告页输入同一令牌后，才能启用渠道、启动或停止检测；不要把令牌写入 Git、报告或截图。
+- Docker 的报告控制区需要设置高熵随机 `DIAGNOSTIC_CONTROL_TOKEN`（建议至少 32 字节随机数）；未配置时控制健康检查返回 503，所有写操作禁用。报告页输入同一令牌后，才能启用渠道、启动或停止检测；不要把令牌写入 Git、报告、截图或命令历史。公网反向代理只转发预期路径，并保留 HTTPS 与访问限制。
 - 默认每个渠道每小时最多执行 110 次请求（两个模型各 55 次）；按渠道数量、超时和保留天数预留磁盘，SQLite 数据会按 `retention_days` 清理。
 
 Docker 部署前可先准备目录和权限：
@@ -61,10 +61,10 @@ hourly-channel-diagnostic/
 └── tests/
 ```
 
-上线还需要一个独立的私有状态目录。当前机器已经生成的示例状态目录是：
+上线还需要一个独立的私有状态目录。以下仅为路径结构示例；实际路径须由部署人员从线上配置核实，不可照抄：
 
 ```text
-/Users/lmurder/Desktop/api中转站/中转站极限测试数据/hourly-channel-release-o75jmg4j/private-channels/
+/var/lib/hourly-channel-diagnostic/
 ├── config.json       # 渠道元数据和 test_models
 ├── credentials.json  # 凭据；必须是 0600 或 0400
 ├── data/             # diagnostic.sqlite3 和锁文件
@@ -153,7 +153,7 @@ mkdir -p "$STATE"
 
 ## Docker Compose 部署
 
-Compose 将报告服务、管理工具和检测 worker 分开：
+Compose 将报告服务、管理工具和检测 worker 分开。由旧版升级时先在旧部署目录确认并停止旧 `worker`，再切换新版 `report + control`；不要同时运行旧 `worker` 和新 `control` 的定时任务。该站点尚未正式使用时可以重建容器，但先保留外置 `config.json`、`credentials.json` 与数据目录的受保护备份；不得使用 `down -v` 删除状态数据。新版 Compose 保留 CPU、内存、进程数及容器日志轮转限制，并为检测容器预留 35 秒停机宽限，以便写入中断状态和刷新报告。
 
 ```bash
 export DIAGNOSTIC_STATE_DIR=/var/lib/hourly-channel-diagnostic
@@ -162,10 +162,10 @@ docker compose --profile monitor up -d
 docker compose ps
 ```
 
-- `control` 提供报告页的启动/停止 API；它使用 `/state/config.json`、私有 Compose secret 中的凭据、`/state/data` 和 `/state/reports`。
+- `control` 提供报告页的启动/停止 API；它使用 `/state/config.json`、私有 Compose secret 中的凭据、`/state/data` 和 `/state/reports`，并将定时检测的启停意愿写入权限 `0600` 的 `/state/control_state.json`。首次部署该文件不存在时不会自动发请求；控制容器重启后只恢复此前明确启动的定时任务，不重放单轮。
 - `report` 默认只绑定 `127.0.0.1:8097`，访问 `/` 或 `/report.html` 查看报告；容器健康检查直接读取 `/report.html`，报告缺失或因目录权限不可读时不会误报健康。
 - `report`、`worker` 和 `toolbox` 使用同一组 `DIAGNOSTIC_UID`/`DIAGNOSTIC_GID`。保持状态目录为 `0700` 时，该 UID/GID 必须与目录属主一致。
-- `worker` 保留为命令行兼容入口，使用 `docker compose --profile worker up -d` 可绕过网页控制直接等待下一个整点。
+- `worker` 保留为命令行兼容入口，使用 `docker compose --profile worker up -d` 可绕过网页控制直接等待下一个整点；网页控制部署不要启用此 profile。
 - 管理操作通过 tools profile 执行，例如：
 
 ```bash
@@ -174,15 +174,20 @@ docker compose --profile tools run --rm toolbox enable --state-dir /state --all
 ```
 
 凭据文件由 Compose secret 挂载为 `/run/secrets/channel_credentials`，不要把它写入镜像层、环境变量、日志或报告。
+部分 Compose 实现会忽略本地文件 secret 的 `uid`、`gid`、`mode` 声明；以宿主机实际文件属主和 `0600/0400` 权限为准，并在启动前确认容器运行 UID 可读取该文件。不要为解决读取失败而开放全局读权限。
 
 启动网页控制服务时：
 
 ```bash
-export DIAGNOSTIC_CONTROL_TOKEN='部署方生成的长随机令牌'
+# 从部署方的密钥管理系统读取随机令牌，避免把令牌字面值写入命令历史。
+printf '控制令牌：'
+read -r -s DIAGNOSTIC_CONTROL_TOKEN
+echo
+export DIAGNOSTIC_CONTROL_TOKEN
 docker compose --profile monitor up -d
 ```
 
-打开报告页，在“运行控制”区域输入同一令牌。点击“启用全部渠道并启动”会先把 16 个渠道设为启用，再启动持续检测；点击“启动检测”只启动已经启用的渠道；“立即执行一轮”会立刻执行完整矩阵，每个启用渠道最多发送 110 次真实请求。持续 daemon 首次执行会等待配置时区的下一个整点。
+打开报告页，在“运行控制”区域输入同一令牌。点击“启用全部渠道并启动”会先把 16 个渠道设为启用，再启动持续检测；点击“启动检测”只启动已经启用的渠道；“立即执行一轮”会立刻执行完整矩阵，每个启用渠道最多发送 110 次真实请求。持续 daemon 首次执行会等待配置时区的下一个整点；其运行时单轮按钮禁用，需要先停止定时检测。检查 `/api/status` 应显示进程阶段、最近一轮已执行/计划、真实退出码和结束原因；完整报告的小时指标只纳入完整轮次。
 
 ## 离线验证和报告
 
@@ -199,16 +204,20 @@ docker compose --profile monitor up -d
 
 ```bash
 PLAYWRIGHT_MODULE=/path/to/playwright \
-PLAYWRIGHT_CHANNEL=msedge \
+PLAYWRIGHT_CHANNEL=chromium \
 "$PYTHON" "$CODE/scripts/test_all.py" \
   --output /外置/全新验收目录
 ```
 
-验收结果必须逐组检查 `syntax`、`security`、`domain`、`http`、`catalog`、`browser`，不能只看最后一行。报告可随时重建：
+验收结果必须逐组检查 `syntax`、`security`、`domain`、`http`、`catalog`、`control`、`browser`，不能只看最后一行。报告可随时重建：
 
 ```bash
 "$PYTHON" "$CODE/manage.py" report --state-dir "$STATE"
 ```
+
+## Tag 与线上部署
+
+GitHub 的 `v*.*.*` tag 工作流只验证测试、镜像构建、控制 API 和资源包；它不会自动更新线上 `diagnostic.nexusapi.link`。推送 tag 后先确认该工作流全部通过，再由部署人员按目标主机的既有流程更新容器。更新前确认旧 `worker` 已停止、外置状态目录有备份，且 `control_state.json` 的自动恢复意愿符合预期。更新后检查容器健康、`/report.html` 与 `/api/status`，并观察首轮完整执行；未授权前不要通过网页或命令触发真实渠道检测。
 
 ## 给另一个 AI 的执行边界
 

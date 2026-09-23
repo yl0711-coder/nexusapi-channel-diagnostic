@@ -4,6 +4,12 @@ services:
     entrypoint: ["nginx", "-g", "daemon off;"]
     user: "${DIAGNOSTIC_UID:-1000}:${DIAGNOSTIC_GID:-1000}"
     restart: unless-stopped
+    mem_limit: 128m
+    cpus: 0.25
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
     ports:
       - "${REPORT_BIND:-127.0.0.1}:${REPORT_PORT:-8097}:8080"
     volumes:
@@ -23,6 +29,12 @@ services:
     build: .
     profiles: [tools]
     user: "${DIAGNOSTIC_UID:-1000}:${DIAGNOSTIC_GID:-1000}"
+    mem_limit: 512m
+    cpus: 0.5
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
     entrypoint: ["python", "-B", "manage.py"]
     volumes:
       - ${DIAGNOSTIC_STATE_DIR:-../hourly-diagnostic-state}:/state
@@ -37,6 +49,13 @@ services:
     profiles: [monitor]
     user: "${DIAGNOSTIC_UID:-1000}:${DIAGNOSTIC_GID:-1000}"
     restart: unless-stopped
+    stop_grace_period: 35s
+    mem_limit: 512m
+    cpus: 0.5
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
     command: ["control_server.py", "--state-dir", "/state", "--credentials", "/run/secrets/channel_credentials", "--port", "8098"]
     volumes:
       - ${DIAGNOSTIC_STATE_DIR:-../hourly-diagnostic-state}:/state
@@ -52,12 +71,24 @@ services:
     tmpfs: [/tmp]
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8098/healthz', timeout=3).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
   worker:
     image: ${DIAGNOSTIC_IMAGE:-hourly-channel-diagnostic:local}
     build: .
     profiles: [worker]
     user: "${DIAGNOSTIC_UID:-1000}:${DIAGNOSTIC_GID:-1000}"
     restart: unless-stopped
+    stop_grace_period: 35s
+    mem_limit: 512m
+    cpus: 0.5
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
     command: ["hourly_channel_diagnostic.py", "daemon", "--config", "/state/config.json", "--credentials", "/run/secrets/channel_credentials", "--data-dir", "/state/data", "--output", "/state/reports/report.html", "--confirm-live"]
     volumes:
       - ${DIAGNOSTIC_STATE_DIR:-../hourly-diagnostic-state}/config.json:/state/config.json:ro

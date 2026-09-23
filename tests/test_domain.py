@@ -202,7 +202,31 @@ class DomainTests(unittest.TestCase):
                 d.run_once(self.config, self.db, True)
         with sqlite3.connect(self.db) as conn:
             self.assertEqual(conn.execute("SELECT count(*) FROM observations").fetchone()[0], 1)
-            self.assertEqual(conn.execute("SELECT status FROM runs").fetchone()[0], "interrupted")
+            self.assertEqual(conn.execute("SELECT status,error,planned_requests FROM runs").fetchone(),
+                             ("interrupted", "operator_stop", 110))
+        self.assertEqual(d.aggregate(self.db, completed_only=True), [])
+        d.build_report(self.db, self.root / "report.html", self.config["timezone"],
+                       self.config["channels"], self.config["test_models"])
+        report = (self.root / "report.html").read_text()
+        self.assertIn("管理员中断", report)
+        self.assertIn("1/110", report)
+        self.assertIn("暂无热力图数据", report)
+
+    def test_system_shutdown_and_recovery_have_distinct_reasons(self):
+        with patch.object(d, "mock_call", side_effect=d.TerminationRequested):
+            with self.assertRaises(d.TerminationRequested):
+                d.run_and_report(self.config, self.db, self.root / "report.html", True, {})
+        with sqlite3.connect(self.db) as conn:
+            self.assertEqual(conn.execute("SELECT status,error FROM runs").fetchone(),
+                             ("interrupted", "system_shutdown"))
+        self.assertIn("系统中断", (self.root / "report.html").read_text())
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE runs SET status='running', error=NULL, finished_at=NULL")
+        self.assertEqual(d.recover_orphaned_runs(self.db), 1)
+        with sqlite3.connect(self.db) as conn:
+            status, reason, finished = conn.execute("SELECT status,error,finished_at FROM runs").fetchone()
+        self.assertEqual((status, reason), ("interrupted", "abrupt_exit"))
+        self.assertIsNotNone(finished)
 
     def test_legacy_rows_remain_readable_without_false_token_or_echo_claims(self):
         conn = sqlite3.connect(self.db)
