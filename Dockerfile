@@ -3,6 +3,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
-COPY hourly_channel_diagnostic.py channel_catalog.py manage.py control_server.py /app/
+COPY hourly_channel_diagnostic.py channel_catalog.py manage.py control_server.py config.example.json /app/
 ENTRYPOINT ["python", "-B"]
 CMD ["manage.py", "--help"]
