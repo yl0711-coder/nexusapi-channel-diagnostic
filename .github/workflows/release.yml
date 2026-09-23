@@ -61,51 +61,6 @@ jobs:
       - name: Verify candidate image CLI
         run: docker run --rm --entrypoint python hourly-channel-diagnostic:ci -B manage.py --help
 
-      - name: Verify private report permissions and health
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          state_dir="$RUNNER_TEMP/state"
-          container_name="channel-diagnostic-report-ci"
-          mkdir -p "$state_dir/data" "$state_dir/reports"
-          chmod 700 "$state_dir" "$state_dir/data" "$state_dir/reports"
-          cp config.example.json "$state_dir/config.json"
-          chmod 600 "$state_dir/config.json"
-          trap 'docker rm --force "$container_name" >/dev/null 2>&1 || true' EXIT
-
-          docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            --volume "$PWD:/source:ro" \
-            --volume "$state_dir:/state" \
-            hourly-channel-diagnostic:ci \
-            /source/hourly_channel_diagnostic.py run-once \
-            --config /state/config.json \
-            --data-dir /state/data \
-            --output /state/reports/report.html \
-            --mock
-
-          docker run --detach \
-            --name "$container_name" \
-            --user "$(id -u):$(id -g)" \
-            --read-only \
-            --tmpfs /tmp \
-            --cap-drop ALL \
-            --security-opt no-new-privileges:true \
-            --publish 127.0.0.1:18097:8080 \
-            --volume "$PWD/nginx.conf:/etc/nginx/nginx.conf:ro" \
-            --volume "$state_dir/reports:/srv/reports:ro" \
-            nginx@sha256:62ff2089abf5a9ed33bd232895bef5e22f7bb4b200675cec49a5ebc48e3d4ac8 \
-            nginx -g 'daemon off;'
-
-          for _ in $(seq 1 20); do
-            if curl --fail --silent --output /dev/null http://127.0.0.1:18097/report.html; then
-              exit 0
-            fi
-            sleep 1
-          done
-          docker logs "$container_name"
-          exit 1
-
       - name: Verify report control API wiring
         shell: bash
         run: |
@@ -151,6 +106,9 @@ jobs:
           done
           test "$report_code" = 200
           test "$status_code" = 200
+          for path in config.json credentials.json data/diagnostic.sqlite3; do
+            test "$(curl --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:8097/$path")" = 404
+          done
           unauth_code="$(curl --silent --output /dev/null --write-out '%{http_code}' -X POST http://127.0.0.1:8097/api/stop)"
           test "$unauth_code" = 403
           auth_code="$(curl --silent --output /dev/null --write-out '%{http_code}' -X POST \
