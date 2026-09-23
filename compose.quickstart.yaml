@@ -17,6 +17,7 @@ services:
       - --mock
     volumes:
       - quickstart-state:/state
+      - ./config.example.json:/app/config.example.json:ro
     restart: "no"
 
   report:
