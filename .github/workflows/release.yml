@@ -106,6 +106,57 @@ jobs:
           docker logs "$container_name"
           exit 1
 
+      - name: Verify report control API wiring
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          state_dir="$RUNNER_TEMP/control-state"
+          project_name="channel-diagnostic-control-ci"
+          mkdir -p "$state_dir/data" "$state_dir/reports"
+          chmod 700 "$state_dir" "$state_dir/data" "$state_dir/reports"
+          cat > "$state_dir/config.json" <<'JSON'
+          {"timezone":"Asia/Shanghai","rounds":1,"juice_runs":1,"test_models":["gpt-5.6-sol","gpt-6-astra"],"data_dir":"data","channels":[]}
+          JSON
+          cat > "$state_dir/credentials.json" <<'JSON'
+          {"credentials":{}}
+          JSON
+          chmod 600 "$state_dir/config.json" "$state_dir/credentials.json"
+          export COMPOSE_PROJECT_NAME="$project_name"
+          export DIAGNOSTIC_STATE_DIR="$state_dir"
+          export DIAGNOSTIC_IMAGE=hourly-channel-diagnostic:ci
+          export DIAGNOSTIC_CONTROL_TOKEN=synthetic-ci-token
+          export DIAGNOSTIC_UID="$(id -u)" DIAGNOSTIC_GID="$(id -g)"
+          compose=(docker compose --profile monitor)
+          cleanup() {
+            "${compose[@]}" down --remove-orphans || true
+          }
+          trap cleanup EXIT
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --volume "$state_dir:/state" \
+            hourly-channel-diagnostic:ci \
+            hourly_channel_diagnostic.py report \
+            --config /state/config.json \
+            --data-dir /state/data \
+            --output /state/reports/report.html
+          "${compose[@]}" config --quiet
+          "${compose[@]}" up --detach --no-build
+          for _ in $(seq 1 30); do
+            report_code="$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8097/report.html || true)"
+            status_code="$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8097/api/status || true)"
+            if [ "$report_code" = 200 ] && [ "$status_code" = 200 ]; then
+              break
+            fi
+            sleep 1
+          done
+          test "$report_code" = 200
+          test "$status_code" = 200
+          unauth_code="$(curl --silent --output /dev/null --write-out '%{http_code}' -X POST http://127.0.0.1:8097/api/stop)"
+          test "$unauth_code" = 403
+          auth_code="$(curl --silent --output /dev/null --write-out '%{http_code}' -X POST \
+            -H 'X-Control-Token: synthetic-ci-token' http://127.0.0.1:8097/api/stop)"
+          test "$auth_code" = 200
+
       - name: Verify release archive
         shell: bash
         run: |
